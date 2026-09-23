@@ -1,116 +1,100 @@
 # BrowserPilot
 
-Универсальный AI-агент, который управляет видимым браузером через tool calling. Он не содержит сценариев конкретных сайтов: перед каждым действием агент читает живой DOM и получает динамические `data-agent-id` селекторы интерактивных элементов.
+An autonomous browser agent for multi-step web tasks. It operates a real, visible Chromium
+session, uses live page state instead of site-specific scripts, and keeps working until the
+task is verified or human input is required.
 
-## Быстрый старт
-
-### Python runtime (рекомендуемый)
+## Run
 
 ```bash
-python3.14 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e .
 python -m playwright install chromium
 cp .env.example .env
 browserpilot
 ```
 
-Python-версия использует `asyncio`, async Playwright, Pydantic Settings и OpenAI-compatible
-tool calling. Это основной bleeding-edge runtime; TypeScript-версия остаётся рядом как
-рабочий legacy-прототип.
+Configure an OpenAI-compatible gateway with `CUSTOM_API_KEY`, `CUSTOM_API_BASE_URL`, and
+`CUSTOM_API_MODEL`. The browser profile (`BROWSER_PROFILE_DIR`) persists cookies and sessions.
+Use `setup` in the CLI for manual registration, login, 2FA, or CAPTCHA; `done` returns control
+to the agent. The process accepts multiple tasks and exits with `exit`.
 
-### TypeScript runtime
+## Technical solution
 
-```bash
-npm install
-npx playwright install chromium
-cp .env.example .env
-# добавить ANTHROPIC_API_KEY в .env
-npm start
-```
+### Automation library
 
-Для собственного OpenAI-compatible API (включая OpenRouter, GLM proxy, LM Studio или свой gateway):
+**Playwright for Python** was selected over Selenium and Puppeteer because it provides reliable
+async browser control, auto-waiting, persistent contexts, popup/page events, and first-class
+support for Chromium. A persistent context makes authentication state reusable without copying
+cookies or credentials into the application.
 
-```dotenv
-CUSTOM_API_KEY=...
-CUSTOM_API_BASE_URL=https://your-gateway.example.com/v1
-CUSTOM_API_MODEL=your-model-name
-```
+### AI SDK and language
 
-Если задан `CUSTOM_API_BASE_URL`, он имеет приоритет над Anthropic. Endpoint должен поддерживать
-`POST /chat/completions` и function/tool calling.
+The runtime is **Python 3.12+**, using the official **OpenAI Python SDK** against any
+OpenAI-compatible API. Python gives a compact async orchestration layer, strong typing through
+modern annotations, and a straightforward path to LangGraph or local-model integrations later.
+The agent does not depend on LangChain: the control loop is intentionally explicit and easy to
+audit.
 
-Агент спросит задачу в терминале, откроет Chromium и покажет рассуждения, инструменты и итог. Для CI можно выставить `HEADLESS=true`.
+### Page information extraction
 
-## Браузерный профиль и авторизация
+The `inspect_page` tool builds a bounded, structured snapshot from the live DOM:
 
-Chromium запускается с постоянным профилем из `BROWSER_PROFILE_DIR` (по умолчанию
-`.browser-profile`). Поэтому cookies, local storage и активные сессии сохраняются между
-запусками. Папка профиля добавлена в `.gitignore` и не должна попадать в git: в ней находятся
-ваши авторизационные данные.
+- current URL and title;
+- visible text;
+- visible interactive elements with generated `data-agent-id` selectors;
+- roles, labels, input types, checked state, and native select options;
+- active dialogs/overlays and scrollable containers;
+- visible landmarks such as buttons, links, menu items, and cart controls.
 
-Первичная настройка:
+Hidden elements are filtered by computed style and geometry. When a modal or fixed layer is
+present, the snapshot is scoped to the top visible layer so stale catalog DOM cannot compete
+with the active product card or checkout panel.
 
-1. В `.env` оставьте `HEADLESS=false` и задайте `START_URL` нужного сайта.
-2. Запустите `npm start`, введите задачу вроде `Открой сайт и остановись, я войду вручную`.
-3. Введите в терминале `setup`. В открывшемся Chromium зарегистрируйтесь или войдите,
-   подтвердите email/телефон и 2FA. Агент в этот момент ничего не делает.
-4. Когда закончите, введите в терминале `done`, затем отправляйте обычные задачи.
-5. При следующих запусках используйте тот же `BROWSER_PROFILE_DIR`: агент увидит сохранённую сессию.
+### Tool-calling architecture
 
-Для нескольких аккаунтов используйте разные каталоги, например
-`BROWSER_PROFILE_DIR=.profiles/shop-account` и `BROWSER_PROFILE_DIR=.profiles/work-account`.
-Не запускайте два процесса с одним профилем одновременно: Chromium блокирует profile directory.
+The agent follows **observe → reason → act → verify**. The model can call generic tools for
+search, navigation, inspection, scrolling, clicking, text entry, keyboard input, native option
+selection, overlay closing, history navigation, waiting, clarification, and completion.
+Selectors are accepted only from the latest inspection snapshot. Tool failures are returned to
+the model as structured results so it can recover instead of terminating the task.
 
-История задач хранится отдельно в `MEMORY_FILE` (по умолчанию `.browser-memory.json`).
-Она передаётся модели при следующем запуске вместе с URL и результатами последних задач.
-Оба файла добавлены в `.gitignore`: не публикуйте их, потому что профиль содержит сессии,
-а memory может содержать чувствительный контекст.
+Completion is guarded: a normal or truncated model response cannot finish a task. `finish` is
+accepted only after a real browser action and explicit progress. API calls have timeouts and
+retries. Recent task summaries and URLs are persisted in `MEMORY_FILE` and supplied to later
+tasks.
 
-Важно: агент не обходит CAPTCHA, антибот-защиту или 2FA. Когда сайт просит такой шаг,
-оставляйте окно видимым и выполняйте его вручную; после этого агент продолжит работу в той же
-сессии. Покупки, удаление данных и отправку сообщений подтверждайте вручную.
+### Dynamic pages, popups, and forms
 
-## Несколько задач за один запуск
+The browser uses one active tab. Newly opened pages become active and extra tabs are closed.
+Visible overlays are detected by ARIA semantics or fixed/absolute geometry and can be closed
+with Escape or a visible close control. Internal modal scrolling is exposed as a tool target.
+Forms use live selectors; native `<select>` controls use `select_option`, while custom radio,
+checkbox, card, cart, and checkout controls are selected from visible labels and landmarks.
+CAPTCHA, 2FA, irreversible purchases, deletion, and message submission remain human-controlled.
 
-CLI не закрывает браузер после завершения задачи. Введите следующую задачу в приглашении
-`Next task (or exit):`. Команды `setup`, `done`, `exit` и `quit` управляют сессией. Все задачи
-используют одну вкладку и один persistent profile, поэтому авторизация сохраняется, но агент
-видит и может использовать текущее состояние страницы после предыдущей задачи.
+### MCP decision
 
-Работает single-tab policy: если сайт открыл ссылку в новой вкладке, она становится активной,
-а остальные вкладки закрываются. При старте лишние вкладки из сохранённого профиля также
-закрываются, чтобы поисковая выдача или checkout-flow не уводили агента от текущего заказа.
+**MCP is not used in the core runtime.** The agent already has a narrow, typed browser tool
+surface and does not need a remote tool registry. MCP would be useful when composing multiple
+external systems (calendar, CRM, payments, or internal APIs); it can be added as an adapter
+without changing the browser or memory layers.
 
-Для modal-карточек snapshot фильтрует скрытый DOM: агент получает только видимые кнопки,
-checkbox/radio, native select и текст `[role="dialog"]`. Также обнаруживаются внутренние
-scroll-контейнеры самой карточки, а не только прокрутка всей страницы. Это важно для
-checkout-модалок Яндекс Еды, где каталог остаётся в DOM под затемнённым overlay.
+## Research and engineering process
 
-После добавления товара агенту доступны отдельные универсальные действия `close_overlay` и
-`go_back`, а prompt требует пройти цепочку `добавить товар -> закрыть карточку при необходимости
--> открыть видимую корзину -> проверить корзину -> перейти к оформлению`. Само финальное
-подтверждение заказа остаётся ручным.
+1. Compared Playwright, Selenium, and Puppeteer for persistent sessions, dynamic UI behavior,
+   and debugging ergonomics; selected Playwright.
+2. Compared provider SDKs and chose OpenAI-compatible tool calling to support hosted gateways,
+   GLM proxies, OpenRouter, and local servers without changing agent logic.
+3. Prototyped a minimal observe/act loop, then tested it against search results, product
+   modals, lazy scrolling, cart drawers, and checkout controls.
+4. Investigated failures from stale DOM, modal overlays, popup tabs, invalid key names,
+   truncated responses, and lost clarification context.
+5. Added visibility-scoped snapshots, single-tab recovery, normalized keyboard input,
+   persistent memory, retries, completion guards, and human-in-the-loop safety boundaries.
 
-Если агенту не хватает данных, он задаёт уточняющий вопрос прямо во время текущей задачи.
-Ответ вводится в prompt `Answer (...)`; исходный запрос, история tool calls и состояние
-браузера сохраняются, поэтому продолжать задачу повторной формулировкой не нужно.
+## Safety
 
-Агент не считает обычный текст модели завершением: если модель вернула длинный/обрезанный
-ответ без tool call, ей автоматически отправляется команда продолжить. `finish` принимается
-только после минимум одного реального browser action (`navigate`, `click`, `type` или `press`);
-одной инспекции страницы или долгого ответа недостаточно.
-
-## Архитектурные решения
-
-- **Observe → reason → act → verify**: `inspect_page` ограничивает контекст видимым текстом и интерактивными узлами, а после действия модель сама решает, нужна ли повторная проверка.
-- **Tool calling вместо парсинга ответа**: модель может навигировать, кликать, заполнять формы, ждать динамический контент, завершать задачу или запрашивать уточнение.
-- **Защитные ограничения**: лимит шагов, таймауты Playwright, отсутствие заранее известных селекторов и правил сайтов. Необратительные действия требуют подтверждения пользователя по системному промпту.
-- **Исполнимый контекст**: состояние браузера живёт в Playwright context, поэтому cookies, редиректы и вкладка сохраняются между шагами.
-
-## Проверка
-
-```bash
-npm run typecheck
-python -m pytest
-```
+Keep `.env`, `.browser-profile`, and `.browser-memory.json` private. The agent does not bypass
+CAPTCHA or 2FA, and it must ask for confirmation before irreversible actions.

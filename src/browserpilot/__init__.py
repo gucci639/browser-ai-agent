@@ -1,1 +1,1 @@
-"""BrowserPilot Python runtime."""
+"""BrowserPilot autonomous browser agent."""
