@@ -1,0 +1,9 @@
+node_modules
+.env
+screenshots
+agent-run.jsonl
+.browser-profile
+.browser-memory.json
+__pycache__
+.pytest_cache
+.venv
