@@ -31,6 +31,10 @@
              Отчёт с источниками
 ```
 
+Период фиксируется в часовом поясе аккаунта. Для конверсии используются история
+переходов и согласованные когорты, а не только текущие статусы сделок. Числовые
+метрики рассчитываются кодом; LLM формулирует объяснения на основе результатов.
+
 Оркестратор принимает естественно-языковой запрос, определяет период и запускает
 сбор данных. Агент amoCRM работает через OAuth 2.0 и REST API: `/api/v4/leads`,
 `/api/v4/tasks`, пользователей и этапы воронки. Агент телефонии получает события
@@ -64,57 +68,65 @@ S3-совместимом хранилище, затем распознаётс�
 
 ## 3. Фрагмент интеграции с amoCRM
 
-Метод получает сделки, изменённые за последние 30 дней, затем отдельным запросом
-загружает задачи и оставляет сделки без задач или с просроченными задачами.
+Пример возвращает сделки без **невыполненных** задач или с хотя бы одной
+просроченной задачей. Проверяются все доступные сделки аккаунта; этот фрагмент
+показывает текущую дисциплину задач, а не историческое состояние за 30 дней.
+Задачи завершённого периода для отчёта загружаются отдельно.
 
 ```python
 import os
 import time
+from collections import defaultdict
 import requests
-from datetime import datetime, timedelta, timezone
 
 BASE = f"https://{os.environ['AMO_SUBDOMAIN']}.amocrm.ru/api/v4"
-HEADERS = {"Authorization": f"Bearer {os.environ['AMO_TOKEN']}"}
+session = requests.Session()
+session.headers['Authorization'] = f"Bearer {os.environ['AMO_TOKEN']}"
 
-def api(path, params):
-    r = requests.get(BASE + path, headers=HEADERS, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json().get("_embedded", {})
-
-def get_leads():
-    since = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp())
-    leads, page = [], 1
+def fetch_all(entity, filters=None):
+    page = 1
     while True:
-        batch = api("/leads", {
-            "page": page, "limit": 250,
-            "filter[updated_at][from]": since,
-        }).get("leads", [])
-        if not batch:
-            break
-        leads += batch
-        if len(batch) < 250:
-            break
+        response = session.get(
+            f"{BASE}/{entity}",
+            params={"limit": 250, "page": page, **(filters or {})},
+            timeout=30,
+        )
+        response.raise_for_status()
+        if response.status_code == 204:
+            return
+        data = response.json()
+        yield from data.get("_embedded", {}).get(entity, [])
+        if not data.get("_links", {}).get("next"):
+            return
         page += 1
-    return leads
 
-def find_problem_leads(leads):
+def find_problem_leads():
     now = int(time.time())
-    result = []
-    for lead in leads:
-        tasks = api("/tasks", {
-            "filter[entity_type]": "leads",
-            "filter[entity_id][]": lead["id"],
-            "limit": 250,
-        }).get("tasks", [])
-        overdue = [t for t in tasks
-                   if not t.get("is_completed")
-                   and t.get("complete_till", 0) < now]
+    tasks_by_lead = defaultdict(list)
+    for task in fetch_all("tasks", {
+        "filter[entity_type]": "leads",
+        "filter[is_completed]": 0,
+    }):
+        tasks_by_lead[task["entity_id"]].append(task)
+    for lead in fetch_all("leads"):
+        tasks = tasks_by_lead[lead["id"]]
+        overdue = [t["id"] for t in tasks if t["complete_till"] < now]
         if not tasks or overdue:
-            result.append({"id": lead["id"], "name": lead.get("name"),
-                           "reason": "no_tasks" if not tasks else "overdue_tasks",
-                           "task_ids": [t["id"] for t in overdue]})
-    return result
+            yield {"id": lead["id"], "name": lead["name"],
+                   "reason": "no_open_tasks" if not tasks else "overdue_tasks",
+                   "overdue_task_ids": overdue}
+
+if __name__ == "__main__":
+    print(list(find_problem_leads()))
 ```
+
+Переменные окружения: `AMO_SUBDOMAIN` и `AMO_TOKEN` (действующий access token).
+В production добавлю обновление OAuth-токена, retries с backoff для 429/5xx,
+фильтрацию активных сделок и проверку полноты доступа. Без доступов к аккаунту
+код не проверялся на реальных данных.
+
+Документация: [сделки](https://www.amocrm.ru/developers/content/crm_platform/leads-api),
+[задачи](https://www.amocrm.ru/developers/content/crm_platform/tasks-api).
 
 ## 4. AI-проект
 
@@ -131,13 +143,19 @@ persistent browser context, structured DOM snapshots, retries и human-in-the-lo
 
 ## 5. Самостоятельное обучение за последние полгода
 
-Я изучил Python asyncio, REST/OAuth-интеграции, tool calling, Playwright,
-обработку транскриптов и базовую оценку качества звонков, PostgreSQL, очереди,
-retries и human-in-the-loop. Эти знания применил в BrowserPilot: добавил
-видимость-ограниченные DOM-снимки, восстановление после ошибок интерфейса,
-сохранение сессий и защиту необратимых действий.
+На примере BrowserPilot могу показать самостоятельное освоение Python asyncio,
+Playwright, tool calling и построения цикла «наблюдение → действие → проверка».
+В проекте применены DOM-снимки, обработка ошибок инструментов, сохранение
+браузерной сессии, retries и контроль завершения задачи.
+
+> Перед отправкой работодателю нужно подтвердить, что обучение относится именно
+> к последним шести месяцам. Работа с amoCRM, транскрибацией и PostgreSQL здесь
+> описана как предложение для решения, а не как подтверждённый опыт проекта.
 
 ## 6. Пример улучшения процесса
+
+> Условный пример реалистичного фриланс-заказа. Это шаблон ответа, а не
+> подтверждённый факт биографии; для отправки его нужно заменить своим случаем.
 
 В сдельном проекте по обработке заявок менеджер вручную переносил обращения из
 формы сайта в таблицу и проверял дубликаты. Я предложил webhook-сервис: он
