@@ -1,5 +1,13 @@
 # BrowserPilot
 
+> Universal AI browser agent for multi-step web tasks.
+
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Playwright](https://img.shields.io/badge/Browser-Playwright-2EAD33?logo=playwright&logoColor=white)](https://playwright.dev/python/)
+[![AI](https://img.shields.io/badge/AI-Tool%20Calling-111827)](https://platform.openai.com/docs/guides/function-calling)
+
+**Портфолио:** [тестовое задание для CityCar](CITYCAR_TEST_TASK.md)
+
 An autonomous browser agent for multi-step web tasks. It operates a real, visible Chromium
 session, uses live page state instead of site-specific scripts, and keeps working until the
 task is verified or human input is required.
